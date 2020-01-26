@@ -61,6 +61,7 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
          * Or 171801 for 51x51x51 (distance = 25): nearest 2^18 = 262144
          * Considering that it's unlikely will be more than 50% of the available area let's keep it to
          * 2^16 and 2^18 for 51 and 101 respectively with 80% load factor
+         * Spasibo Artyom
          */
         this.heatMultiplierByPos = new HashMap<BlockPos, Integer>((int)Math.pow(2, 18), 0.8f);
         this.maxSpreadBox = new AxisAlignedBB(this.pos.getX() - MAX_SPREAD_DISTANCE, this.pos.getY() - MAX_SPREAD_DISTANCE, this.pos.getZ() - MAX_SPREAD_DISTANCE, this.pos.getX() + MAX_SPREAD_DISTANCE, this.pos.getY() + MAX_SPREAD_DISTANCE, this.pos.getZ() + MAX_SPREAD_DISTANCE);
@@ -122,6 +123,8 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
     /**
      * For better performance we'll use somewhat mix of Flood fill and Forest Fire algorithms
      * Similar thing Minecraft uses for light calculation
+     *
+     * @todo Why not to warm up only limited value?
      */
     public void fill()
     {
@@ -132,7 +135,7 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
         BlockPos originPos = this.getPos();
 
         AbstractMap.SimpleEntry<BlockPos,Integer> queueItem = new AbstractMap.SimpleEntry<>(originPos, MAX_SPREAD_DISTANCE);
-        Stack<AbstractMap.SimpleEntry<BlockPos,Integer>> positionsToSpread = new Stack<>();
+        LinkedList<AbstractMap.SimpleEntry<BlockPos,Integer>> positionsToSpread = new LinkedList<>();
         positionsToSpread.add(queueItem);
 
         fill(positionsToSpread);
@@ -140,7 +143,7 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
         ToughAsNails.logger.warn("TAN Lookup Heated End");
     }
 
-    public void fill(Stack<AbstractMap.SimpleEntry<BlockPos,Integer>> positionsToSpread)
+    public void fill(LinkedList<AbstractMap.SimpleEntry<BlockPos,Integer>> positionsToSpread)
     {
         do {
             AbstractMap.SimpleEntry<BlockPos,Integer> spreadingPair = positionsToSpread.pop();
@@ -154,9 +157,6 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
                 continue;
             }
 
-            // Add current
-            this.heatMultiplierByPos.put(spreadingPosition, spreadingPair.getValue());
-
             for (EnumFacing facing : EnumFacing.values())
             {
                 BlockPos offsetPos = spreadingPosition.offset(facing);
@@ -165,16 +165,26 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
                     continue;
                 }
 
+                Integer nextStrength = spreadingPair.getValue() - 1;
+
                 //Only attempt to update tracking for this position if there is air here.
                 //Even positions already being tracked should be filled with air.
                 if (this.canFill(offsetPos)) {
-                    AbstractMap.SimpleEntry<BlockPos,Integer> queueItem = new AbstractMap.SimpleEntry<>(offsetPos, spreadingPair.getValue() - 1);
+                    // Add to queue to check spreading
+                    AbstractMap.SimpleEntry<BlockPos,Integer> queueItem = new AbstractMap.SimpleEntry<>(offsetPos, nextStrength);
                     positionsToSpread.add(queueItem);
+
+                    /*
+                     * Add to map immediately to prevent re-checking
+                     * Block positions that were in queue initially (usually only central block) will not be included because
+                     * there's no need to warm block itself and quick cached queue should be already in map
+                     */
+                    this.heatMultiplierByPos.put(offsetPos, nextStrength);
                 }
             }
         } while (!positionsToSpread.isEmpty());
 
-        ToughAsNails.logger.warn("TAN Queue Items" + this.heatMultiplierByPos.size());
+        ToughAsNails.logger.warn("TAN Map Items" + this.heatMultiplierByPos.size());
     }
 
     /** Returns true if verified, false if regen is required *//*
