@@ -7,11 +7,12 @@
  ******************************************************************************/
 package toughasnails.tileentity;
 
-import java.util.Set;
+import java.util.*;
 
 import com.google.common.base.Predicate;
 import com.google.common.collect.Sets;
 
+import net.minecraft.block.Block;
 import net.minecraft.block.state.IBlockState;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.EntityPlayer;
@@ -24,22 +25,21 @@ import net.minecraft.util.ITickable;
 import net.minecraft.util.math.AxisAlignedBB;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.World;
+import org.apache.commons.lang3.tuple.Pair;
 import toughasnails.api.TANCapabilities;
 import toughasnails.api.stat.capability.ITemperature;
 import toughasnails.api.temperature.ITemperatureRegulator;
 import toughasnails.api.temperature.Temperature;
 import toughasnails.block.BlockTANTemperatureCoil;
+import toughasnails.core.ToughAsNails;
 
 public class TileEntityTemperatureSpread extends TileEntity implements ITickable, ITemperatureRegulator
 {
     public static final int MAX_SPREAD_DISTANCE = 50;
     public static final int RATE_MODIFIER = -500;
     public static final boolean ENABLE_DEBUG = false;
-    
-    private Set<Entity> spawnedEntities;
-    
-    private Set<BlockPos>[] filledPositions;
-    private Set<BlockPos> obstructedPositions;
+
+    private HashMap<BlockPos, Integer> heatMultiplierByPos;
     
     private int updateTicks;
     private int temperatureModifier;
@@ -48,15 +48,22 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
     
     public TileEntityTemperatureSpread() 
     {
-        //Initialize sets for all strengths
-        this.filledPositions = new Set[MAX_SPREAD_DISTANCE + 1];
-        for (int i = 0; i < MAX_SPREAD_DISTANCE + 1; i++)
-        {
-            this.filledPositions[i] = Sets.newConcurrentHashSet();
-        }
-        this.obstructedPositions = Sets.newConcurrentHashSet();
-        
-        if (ENABLE_DEBUG) this.spawnedEntities = Sets.newHashSet();
+        /**
+         * We could reserve (MAX_SPREAD_DISTANCE * 2 + 1) ^ 3
+         * But actually we should allocate memory for only potential filled
+         * Blocks, so considering we have diagonals
+         * ###X###
+         * ##XXX##
+         * #XXXXX#
+         * ##XXX##
+         * ###X###
+         * Actual size will be 1353601 for 101x101x101 (distance = 50): nearest 2^21 = 2097152
+         * Or 171801 for 51x51x51 (distance = 25): nearest 2^18 = 262144
+         * Considering that it's unlikely will be more than 50% of the available area let's keep it to
+         * 2^16 and 2^18 for 51 and 101 respectively with 80% load factor
+         */
+        this.heatMultiplierByPos = new HashMap<BlockPos, Integer>((int)Math.pow(2, 18), 0.8f);
+        this.maxSpreadBox = new AxisAlignedBB(this.pos.getX() - MAX_SPREAD_DISTANCE, this.pos.getY() - MAX_SPREAD_DISTANCE, this.pos.getZ() - MAX_SPREAD_DISTANCE, this.pos.getX() + MAX_SPREAD_DISTANCE, this.pos.getY() + MAX_SPREAD_DISTANCE, this.pos.getZ() + MAX_SPREAD_DISTANCE);
     }
     
     public TileEntityTemperatureSpread(int temperatureModifier)
@@ -81,44 +88,19 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
         }
 
         //Verify every second
-        if (++updateTicks % 20 == 0)
-        {
-            // Attempt to fill again if no positions are being regulated
-            // Also refill if there has been any changes since last time
-            if (!this.isActive() || !this.verify())
-            {
-                //Refill again
-                fill();
+        if (++updateTicks % 20 == 0) {
+            if (this.heatMultiplierByPos.isEmpty()) {
+                this.fill();
             }
-            
-            //When first placed, this may be null because it hasn't been created when read from NBT
-            if (this.maxSpreadBox == null)
-            {
-                this.maxSpreadBox = new AxisAlignedBB(this.pos.getX() - MAX_SPREAD_DISTANCE, this.pos.getY() - MAX_SPREAD_DISTANCE, this.pos.getZ() - MAX_SPREAD_DISTANCE, this.pos.getX() + MAX_SPREAD_DISTANCE, this.pos.getY() + MAX_SPREAD_DISTANCE, this.pos.getZ() + MAX_SPREAD_DISTANCE);
-            }
-            
+
             //Iterate over all nearby players
             for (EntityPlayer player : world.getEntitiesWithinAABB(EntityPlayer.class, this.maxSpreadBox))
             {
                 BlockPos delta = player.getPosition().subtract(this.getPos());
                 int distance = Math.abs(delta.getX()) + Math.abs(delta.getY()) + Math.abs(delta.getZ());
                 boolean collided = false;
-                
-                //Check if the player collides with any of the filled positions.
-                //Player must be in a strength equal to or less than the distance they are away from the coil
-                outer:
-                for (int i = MAX_SPREAD_DISTANCE - distance; i >= 0; i--)
-                {
-                    for (BlockPos pos : this.filledPositions[i])
-                    {
-                        //If a collision is found, stop looking
-                        if (player.getEntityBoundingBox().intersects(pos.getX(), pos.getY(), pos.getZ(), pos.getX() + 1D, pos.getY() + 1D, pos.getZ() + 1D))
-                        {
-                            collided = true;
-                            break outer;
-                        }
-                    }
-                }
+
+                collided = this.heatMultiplierByPos.get(player.getPosition()) != null;
                 
                 //Apply temperature modifier if collided
                 if (collided)
@@ -129,146 +111,73 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
                     temperature.applyModifier("Climatisation", this.temperatureModifier, RATE_MODIFIER, 3 * 20);
                 }
             }
-
-            if (ENABLE_DEBUG)
-            {
-                //There is a mismatch between the filled positions and the spawned entities, repopulate spawned entities
-                //If this is active, there should at least be a position in the set for the max spread distance
-                if (!world.isRemote && spawnedEntities.isEmpty() && !this.filledPositions[MAX_SPREAD_DISTANCE].isEmpty())
-                {
-                    for (int strength = 0; strength <= MAX_SPREAD_DISTANCE; strength++)
-                    {
-                        for (BlockPos pos : this.filledPositions[strength])
-                        {
-                            final AxisAlignedBB boundingBox = new AxisAlignedBB(pos.getX(), pos.getY(), pos.getZ(), pos.getX() + 1.0D, pos.getY() + 1.0D, pos.getZ() + 1.0D);
-
-                            Predicate<EntitySmallFireball> predicate = new Predicate<EntitySmallFireball>()
-                            {
-                                @Override
-                                public boolean apply(EntitySmallFireball input) 
-                                {
-                                    //Check intersections with this entity a little bit over 1x1x1, because it seemed the outer layer of fireballs wasn't
-                                    //included otherwise
-                                    BlockPos pos = input.getPosition();
-                                    return boundingBox.intersects(pos.getX() - 0.1D, pos.getY() - 0.1D, pos.getZ() - 0.1D, pos.getX() + 1.1D, pos.getY() + 1.1D, pos.getZ() + 1.1D);
-                                }
-                            };
-                            
-                            //Fireballs don't have a bounding box so we can't use getEntitiesWithinAABB (which really stinks!)
-                            spawnedEntities.addAll(this.getWorld().getEntities(EntitySmallFireball.class, predicate));
-                        }
-                    }
-                }
-            }
         }
     }
 
     public void reset()
     {
-        if (ENABLE_DEBUG)
-        {
-            for (Entity entity : this.spawnedEntities)
-            {
-                entity.setDead();
-            }
-            this.spawnedEntities.clear();
-        }
-        
-        //Clear set of current positions
-        for (Set<BlockPos> set : this.filledPositions)
-        {
-            set.clear();
-        }
-        this.obstructedPositions.clear();
+        this.heatMultiplierByPos.clear();
     }
-    
+
+    /**
+     * For better performance we'll use somewhat mix of Flood fill and Forest Fire algorithms
+     * Similar thing Minecraft uses for light calculation
+     */
     public void fill()
     {
         reset();
-        
-        //Add blocks around the temperature modifier block to the queue
-        for (EnumFacing facing : EnumFacing.values())
-        {
-            BlockPos offsetPos = pos.offset(facing);
-            
-            //Only attempt to update tracking for this position if there is air here.
-            //Even positions already being tracked should be filled with air.
-            if (this.canFill(offsetPos))
-                this.filledPositions[MAX_SPREAD_DISTANCE].add(offsetPos);
-        }
-        
-        runStage(MAX_SPREAD_DISTANCE - 1);
-        
-        if (ENABLE_DEBUG)
-        {
-            for (Set<BlockPos> trackedPositions : this.filledPositions)
-            {
-                for (BlockPos trackedPosition : trackedPositions)
-                {
-                    if (trackedPosition != null)
-                    {
-                        BlockPos pos = trackedPosition;
-                        EntitySmallFireball fireball = new EntitySmallFireball(getWorld(), (double)pos.getX() + 0.5D, (double)pos.getY() + 0.5D, (double)pos.getZ() + 0.5D, 0.0D, 0.0D, 0.0D);
-                        this.spawnedEntities.add(fireball);
-                        this.getWorld().spawnEntity(fireball);
-                    }
-                }
-            }
-        }
-    }
-    
-    private void runStage(int strength)
-    {
-        //Don't spread if strength is 0 (or somehow less)
-        if (strength > 0)
-        {
-            //Populate queue for next stage
-            for (BlockPos trackedPosition : this.filledPositions[strength + 1])
-            {      
-                BlockPos pos = trackedPosition;
-                spreadAroundPos(pos, strength);
-            }
-            
-            //Next stage should have less strength than this
-            runStage(strength - 1);
-        }
-    }
-    
-    /** Begins tracking this position or updates its strength. Returns true if changed from before **/
-    private void setTrackedStrength(BlockPos pos, int strength)
-    {
-        //Only attempt to update tracking for this position if there is air here.
-        //Even positions already being tracked should be filled with air.
-        if (this.canFill(pos))
-        {
-            this.filledPositions[strength].add(pos);
-        }
-        else
-        {
-            this.obstructedPositions.add(pos);
-        }
-    }
-    
-    /**Strength is the strength of the initial pos, 
-     * not what it will spread to its surroundings*/
-    private void spreadAroundPos(BlockPos pos, int strength)
-    {
-        for (EnumFacing facing : EnumFacing.values())
-        {
-            BlockPos offsetPos = pos.offset(facing);
 
-            //Don't set if the tracked positions already contains this position
-            if (this.filledPositions[strength + 1].contains(offsetPos))
-            {
+        ToughAsNails.logger.warn("TAN Lookup Heated Area");
+
+        BlockPos originPos = this.getPos();
+
+        AbstractMap.SimpleEntry<BlockPos,Integer> queueItem = new AbstractMap.SimpleEntry<>(originPos, MAX_SPREAD_DISTANCE);
+        Stack<AbstractMap.SimpleEntry<BlockPos,Integer>> positionsToSpread = new Stack<>();
+        positionsToSpread.add(queueItem);
+
+        fill(positionsToSpread);
+
+        ToughAsNails.logger.warn("TAN Lookup Heated End");
+    }
+
+    public void fill(Stack<AbstractMap.SimpleEntry<BlockPos,Integer>> positionsToSpread)
+    {
+        do {
+            AbstractMap.SimpleEntry<BlockPos,Integer> spreadingPair = positionsToSpread.pop();
+            BlockPos spreadingPosition = spreadingPair.getKey();
+
+            if (spreadingPair == null) {
                 continue;
             }
-            
-            //Set suitable adjacent positions as tracked
-            setTrackedStrength(offsetPos, strength);
-        }
+
+            if (spreadingPair.getValue() <= 0) {
+                continue;
+            }
+
+            // Add current
+            this.heatMultiplierByPos.put(spreadingPosition, spreadingPair.getValue());
+
+            for (EnumFacing facing : EnumFacing.values())
+            {
+                BlockPos offsetPos = spreadingPosition.offset(facing);
+
+                if (this.heatMultiplierByPos.get(offsetPos) != null) {
+                    continue;
+                }
+
+                //Only attempt to update tracking for this position if there is air here.
+                //Even positions already being tracked should be filled with air.
+                if (this.canFill(offsetPos)) {
+                    AbstractMap.SimpleEntry<BlockPos,Integer> queueItem = new AbstractMap.SimpleEntry<>(offsetPos, spreadingPair.getValue() - 1);
+                    positionsToSpread.add(queueItem);
+                }
+            }
+        } while (!positionsToSpread.isEmpty());
+
+        ToughAsNails.logger.warn("TAN Queue Items" + this.heatMultiplierByPos.size());
     }
 
-    /** Returns true if verified, false if regen is required */
+    /** Returns true if verified, false if regen is required *//*
     public boolean verify()
     {
         for (Set<BlockPos> trackedPositions : this.filledPositions)
@@ -278,24 +187,9 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
                 if (!this.canFill(pos)) return false;
             }
         }
-        
-        for (BlockPos pos : this.obstructedPositions)
-        {
-            if (this.canFill(pos)) return false;
-        }
 
         return true;
-    }
-
-    /**
-     * Returns true if any positions are being regulated by this coil
-     *
-     * @return True if active
-     */
-    public boolean isActive()
-    {
-        return !this.filledPositions[MAX_SPREAD_DISTANCE].isEmpty();
-    }
+    }*/
     
     private boolean canFill(BlockPos pos)
     {
@@ -303,14 +197,11 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
         return !this.getWorld().isBlockFullCube(pos) && (!this.getWorld().canSeeSky(pos));
     }
     
-    @Override
+    /*@Override
     public void readFromNBT(NBTTagCompound compound)
     {
         super.readFromNBT(compound);
-        
-        //After pos has been read
-        this.maxSpreadBox = new AxisAlignedBB(this.pos.getX() - MAX_SPREAD_DISTANCE, this.pos.getY() - MAX_SPREAD_DISTANCE, this.pos.getZ() - MAX_SPREAD_DISTANCE, this.pos.getX() + MAX_SPREAD_DISTANCE, this.pos.getY() + MAX_SPREAD_DISTANCE, this.pos.getZ() + MAX_SPREAD_DISTANCE);
-        
+
         if (compound.hasKey("FilledPositions"))
         {
             this.temperatureModifier = compound.getInteger("TemperatureModifier");
@@ -353,7 +244,7 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
         compound.setTag("ObstructedPositions", obstructedCompound);
         
         return compound;
-    }
+    }*/
     
     @Override
     public boolean shouldRefresh(World world, BlockPos pos, IBlockState oldState, IBlockState newSate)
@@ -400,12 +291,6 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
     @Override
     public boolean isPosRegulated(BlockPos pos) 
     {
-        for (int i = 0; i < MAX_SPREAD_DISTANCE; i++)
-        {
-            Set<BlockPos> regulatedPositions = this.filledPositions[i];
-            if (regulatedPositions.contains(pos)) return true;
-        }
-        
-        return false;
+        return this.heatMultiplierByPos.get(pos) != null;
     }
 }
