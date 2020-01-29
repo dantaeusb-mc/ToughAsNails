@@ -166,13 +166,30 @@ public class BlockTANTemperatureCoil extends BlockContainer implements ITANBlock
     @Override
     public void neighborChanged(IBlockState state, World world, BlockPos pos, Block neighborBlock, BlockPos neighborPos)
     {
-        updatePowered(world, pos, state);
+        ToughAsNails.logger.warn("TAN neighborChanged");
+        updateArea(world, pos, state, neighborPos);
     }
     
     @Override
     public void updateTick(World world, BlockPos pos, IBlockState state, Random rand)
     {
         updatePowered(world, pos, state);
+    }
+
+    private void updateArea(World world, BlockPos pos, IBlockState state, BlockPos neighborPos)
+    {
+        boolean powered = world.isBlockPowered(pos) || world.isBlockPowered(pos.up());
+        TileEntity te = world.getTileEntity(pos);
+
+        if (!world.isRemote && te != null && powered != (Boolean)world.getBlockState(pos).getValue(POWERED))
+        {
+            TileEntityTemperatureSpread tempFill = (TileEntityTemperatureSpread)te;
+
+            if (powered)
+            {
+                tempFill.handleBlockChange(neighborPos);
+            }
+        }
     }
     
     private void updatePowered(World world, BlockPos pos, IBlockState state)

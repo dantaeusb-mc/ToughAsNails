@@ -43,6 +43,7 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
     
     private int updateTicks;
     private int temperatureModifier;
+    private LinkedList<AbstractMap.SimpleEntry<BlockPos,Integer>> invalidatedPos = new LinkedList<>();
 
     private AxisAlignedBB maxSpreadBox;
     
@@ -52,11 +53,11 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
          * We could reserve (MAX_SPREAD_DISTANCE * 2 + 1) ^ 3
          * But actually we should allocate memory for only potential filled
          * Blocks, so considering we have diagonals
-         * ###X###
-         * ##XXX##
-         * #XXXXX#
-         * ##XXX##
-         * ###X###
+         * ##X##
+         * #XXX#
+         * XXXXX
+         * #XXX#
+         * ##X##
          * Actual size will be 1353601 for 101x101x101 (distance = 50): nearest 2^21 = 2097152
          * Or 171801 for 51x51x51 (distance = 25): nearest 2^18 = 262144
          * Considering that it's unlikely will be more than 50% of the available area let's keep it to
@@ -64,7 +65,6 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
          * Spasibo Artyom
          */
         this.heatMultiplierByPos = new HashMap<BlockPos, Integer>((int)Math.pow(2, 18), 0.8f);
-        this.maxSpreadBox = new AxisAlignedBB(this.pos.getX() - MAX_SPREAD_DISTANCE, this.pos.getY() - MAX_SPREAD_DISTANCE, this.pos.getZ() - MAX_SPREAD_DISTANCE, this.pos.getX() + MAX_SPREAD_DISTANCE, this.pos.getY() + MAX_SPREAD_DISTANCE, this.pos.getZ() + MAX_SPREAD_DISTANCE);
     }
     
     public TileEntityTemperatureSpread(int temperatureModifier)
@@ -95,7 +95,7 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
             }
 
             //Iterate over all nearby players
-            for (EntityPlayer player : world.getEntitiesWithinAABB(EntityPlayer.class, this.maxSpreadBox))
+            for (EntityPlayer player : world.getEntitiesWithinAABB(EntityPlayer.class, this.getMaxSpreadBox()))
             {
                 BlockPos delta = player.getPosition().subtract(this.getPos());
                 int distance = Math.abs(delta.getX()) + Math.abs(delta.getY()) + Math.abs(delta.getZ());
@@ -106,6 +106,8 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
                 //Apply temperature modifier if collided
                 if (collided)
                 {
+                    ToughAsNails.logger.warn("TAN Climatized Player Strength: " + this.heatMultiplierByPos.get(player.getPosition()));
+
                     ITemperature temperature = player.getCapability(TANCapabilities.TEMPERATURE, null);
                     
                     //Apply modifier for 5 seconds
@@ -113,11 +115,36 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
                 }
             }
         }
+
+        // If invalidated, reindex area once per three seconds
+        if (updateTicks % 60 == 0 && !this.invalidatedPos.isEmpty()) {
+            ToughAsNails.logger.warn("TAN Reindex Invalidated Positions");
+            // @TODO: cleanup first ones with lower strength
+            this.fill(this.invalidatedPos);
+        }
     }
 
     public void reset()
     {
         this.heatMultiplierByPos.clear();
+    }
+
+    /**
+     * Invalidate and mark block for quick reindex
+     * @param changedBlockPos BlockPos
+     */
+    public void handleBlockChange(BlockPos changedBlockPos)
+    {
+        ToughAsNails.logger.warn("TAN Handle Block Change");
+
+        for (EnumFacing facing : EnumFacing.values()) {
+            BlockPos offsetPos = changedBlockPos.offset(facing);
+
+            if (this.heatMultiplierByPos.get(offsetPos) != null) {
+                AbstractMap.SimpleEntry<BlockPos,Integer> queueItem = new AbstractMap.SimpleEntry<>(offsetPos, this.heatMultiplierByPos.get(offsetPos));
+                this.invalidatedPos.add(queueItem);
+            }
+        }
     }
 
     /**
@@ -139,6 +166,7 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
         positionsToSpread.add(queueItem);
 
         fill(positionsToSpread);
+        this.invalidatedPos.clear();
 
         ToughAsNails.logger.warn("TAN Lookup Heated End");
     }
@@ -185,6 +213,20 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
         } while (!positionsToSpread.isEmpty());
 
         ToughAsNails.logger.warn("TAN Map Items" + this.heatMultiplierByPos.size());
+    }
+
+    /**
+     * Cannot be defined on initialization time, should be lazy initialized.
+     *
+     * @return AxisAlignedBB
+     */
+    private AxisAlignedBB getMaxSpreadBox()
+    {
+        if (this.maxSpreadBox == null) {
+            this.maxSpreadBox = new AxisAlignedBB(this.pos.getX() - MAX_SPREAD_DISTANCE, this.pos.getY() - MAX_SPREAD_DISTANCE, this.pos.getZ() - MAX_SPREAD_DISTANCE, this.pos.getX() + MAX_SPREAD_DISTANCE, this.pos.getY() + MAX_SPREAD_DISTANCE, this.pos.getZ() + MAX_SPREAD_DISTANCE);
+        }
+
+        return this.maxSpreadBox;
     }
 
     /** Returns true if verified, false if regen is required *//*
