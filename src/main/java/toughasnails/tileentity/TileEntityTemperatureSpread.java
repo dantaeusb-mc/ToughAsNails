@@ -9,14 +9,15 @@ package toughasnails.tileentity;
 
 import java.util.*;
 
-import com.google.common.base.Predicate;
 import com.google.common.collect.Sets;
 
 import net.minecraft.block.Block;
+import net.minecraft.block.BlockColored;
+import net.minecraft.block.material.Material;
 import net.minecraft.block.state.IBlockState;
-import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.EntityPlayer;
-import net.minecraft.entity.projectile.EntitySmallFireball;
+import net.minecraft.init.Blocks;
+import net.minecraft.item.EnumDyeColor;
 import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.nbt.NBTUtil;
 import net.minecraft.tileentity.TileEntity;
@@ -25,7 +26,7 @@ import net.minecraft.util.ITickable;
 import net.minecraft.util.math.AxisAlignedBB;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.World;
-import org.apache.commons.lang3.tuple.Pair;
+import org.apache.commons.lang3.Validate;
 import toughasnails.api.TANCapabilities;
 import toughasnails.api.stat.capability.ITemperature;
 import toughasnails.api.temperature.ITemperatureRegulator;
@@ -37,13 +38,17 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
 {
     public static final int MAX_SPREAD_DISTANCE = 50;
     public static final int RATE_MODIFIER = -500;
-    public static final boolean ENABLE_DEBUG = false;
+    public static final boolean ENABLE_DEBUG = true;
+    public static final boolean HORIZONTAL = true;
 
-    private HashMap<BlockPos, Integer> heatMultiplierByPos;
+    private HashMap<BlockPos, Integer> spreadedBlocks;
+    private HashMap<BlockPos, Integer> edgeBlocks;
+
+    private HashMap<BlockPos, Integer> debugLayer;
     
     private int updateTicks;
     private int temperatureModifier;
-    private LinkedList<AbstractMap.SimpleEntry<BlockPos,Integer>> invalidatedPos = new LinkedList<>();
+    private LinkedList<SpreadBlock> invalidatedPos = new LinkedList<>();
 
     private AxisAlignedBB maxSpreadBox;
     
@@ -64,7 +69,13 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
          * 2^16 and 2^18 for 51 and 101 respectively with 80% load factor
          * Spasibo Artyom
          */
-        this.heatMultiplierByPos = new HashMap<BlockPos, Integer>((int)Math.pow(2, 18), 0.8f);
+        this.spreadedBlocks = new HashMap<>((int)Math.pow(2, 18), 0.8f);
+        this.edgeBlocks = new HashMap<>((int)Math.pow(2, 8));
+
+        if (TileEntityTemperatureSpread.ENABLE_DEBUG) {
+            this.debugLayer = new HashMap<>();
+            ToughAsNails.logger.warn("TAN New Climatizer");
+        }
     }
     
     public TileEntityTemperatureSpread(int temperatureModifier)
@@ -81,6 +92,11 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
     {
         World world = this.getWorld();
 
+        // We don't need to handle such calculations on client side
+        if (world.isRemote) {
+            return;
+        }
+
         // If the block isn't powered, we should reset
         if (!world.getBlockState(this.getPos()).getValue(BlockTANTemperatureCoil.POWERED))
         {
@@ -90,8 +106,9 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
 
         //Verify every second
         if (++updateTicks % 20 == 0) {
-            if (this.heatMultiplierByPos.isEmpty()) {
+            if (this.spreadedBlocks.isEmpty()) {
                 this.fill();
+                this.drawDebugLayer(world);
             }
 
             //Iterate over all nearby players
@@ -101,12 +118,12 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
                 int distance = Math.abs(delta.getX()) + Math.abs(delta.getY()) + Math.abs(delta.getZ());
                 boolean collided = false;
 
-                collided = this.heatMultiplierByPos.get(player.getPosition()) != null;
+                collided = this.spreadedBlocks.get(player.getPosition()) != null;
                 
                 //Apply temperature modifier if collided
                 if (collided)
                 {
-                    ToughAsNails.logger.warn("TAN Climatized Player Strength: " + this.heatMultiplierByPos.get(player.getPosition()));
+                    ToughAsNails.logger.warn("TAN Climatized Player Strength: " + this.spreadedBlocks.get(player.getPosition()));
 
                     ITemperature temperature = player.getCapability(TANCapabilities.TEMPERATURE, null);
                     
@@ -116,35 +133,176 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
             }
         }
 
+        // Every two seconds - check edges
+        // Every ten seconds - check spread value
         // If invalidated, reindex area once per three seconds
-        if (updateTicks % 60 == 0 && !this.invalidatedPos.isEmpty()) {
-            ToughAsNails.logger.warn("TAN Reindex Invalidated Positions");
-            // @TODO: cleanup first ones with lower strength
-            this.fill(this.invalidatedPos);
+        if ((updateTicks % (2 * 20)) == 0) {
+            this.reindexEdges();
+
+            if ((updateTicks % (5 * 20)) == 0) {
+                this.reindexSpreadValue();
+            }
+
+            if (!this.invalidatedPos.isEmpty()) {
+                ToughAsNails.logger.warn("TAN Starting Cleanup, Invalidated: " + this.invalidatedPos.size());
+                LinkedList<SpreadBlock> refillQueue = this.cleanupInvalidated();
+                ToughAsNails.logger.warn("TAN Starting Refill, In Queue: " + refillQueue.size());
+                this.fill(refillQueue);
+                ToughAsNails.logger.warn("TAN End Refill");
+                this.drawDebugLayer(world);
+            }
         }
     }
 
     public void reset()
     {
-        this.heatMultiplierByPos.clear();
+        this.edgeBlocks.clear();
+        this.spreadedBlocks.clear();
+    }
+
+    private void reindexEdges()
+    {
+        Integer invalidatedCount = 0;
+
+        // Use iterators to be able to remove items while working
+        // Eventually it should be removed on invalidation,
+        // Otherwise path will be blocked and old, blocked areas will be filled
+        for (Iterator<BlockPos> edgeBlocksIterator = this.edgeBlocks.keySet().iterator(); edgeBlocksIterator.hasNext(); ) {
+            BlockPos pos = edgeBlocksIterator.next();
+
+            if (this.canFill(pos)) {
+                invalidatedCount += this.invalidateAround(pos);
+            }
+        }
+
+        if (TileEntityTemperatureSpread.ENABLE_DEBUG && invalidatedCount > 0) {
+            ToughAsNails.logger.warn("TAN Invalidated Edges: " + invalidatedCount);
+        }
+    }
+
+    private void reindexSpreadValue()
+    {
+        Integer invalidatedCount = 0;
+
+        // Use iterators to be able to remove items while working
+        // Eventually it should be removed on invalidation,
+        // Otherwise path will be blocked and old, blocked areas will be filled
+        for (Iterator<BlockPos> spreadBlocksIterator = this.spreadedBlocks.keySet().iterator(); spreadBlocksIterator.hasNext(); ) {
+            BlockPos pos = spreadBlocksIterator.next();
+
+            if (!this.canFill(pos)) {
+                invalidatedCount += this.invalidateAround(pos);
+            }
+        }
+
+        if (TileEntityTemperatureSpread.ENABLE_DEBUG && invalidatedCount > 0) {
+            ToughAsNails.logger.warn("TAN Invalidated Spread: " + invalidatedCount);
+        }
+    }
+
+    private Integer invalidateAround(BlockPos pos)
+    {
+        Integer invalidatedCount = 0;
+
+        // We're invalidating not the block itself - we just removing it
+        // We invalidating blocks next to it to rebuild value
+        for (EnumFacing facing : EnumFacing.values()) {
+            if (TileEntityTemperatureSpread.HORIZONTAL && (facing == EnumFacing.DOWN || facing == EnumFacing.UP)) {
+                continue;
+            }
+
+            BlockPos offsetPos = pos.offset(facing);
+
+            if (this.spreadedBlocks.get(offsetPos) != null) {
+                SpreadBlock invalidatedSpreadBlock = new SpreadBlock(offsetPos, this.spreadedBlocks.get(offsetPos));
+                this.invalidatedPos.add(invalidatedSpreadBlock);
+                invalidatedCount++;
+            }
+        }
+
+        return invalidatedCount;
     }
 
     /**
-     * Invalidate and mark block for quick reindex
-     * @param changedBlockPos BlockPos
+     * Cleanup STARTING from invalidated, do not remove invalidated blocks
+     * themselves, we invalidate blocks around
+     *
+     * @return
      */
-    public void handleBlockChange(BlockPos changedBlockPos)
+    private LinkedList<SpreadBlock> cleanupInvalidated()
     {
-        ToughAsNails.logger.warn("TAN Handle Block Change");
+        LinkedList<SpreadBlock> refillQueue = new LinkedList<>();
+        LinkedList<SpreadBlock> cleanupQueue = new LinkedList<>();
+        Integer cleaned = 0;
 
-        for (EnumFacing facing : EnumFacing.values()) {
-            BlockPos offsetPos = changedBlockPos.offset(facing);
+        // Sort by strength so we may not need to cleanup some blocks that are already dependable
+        this.invalidatedPos.sort(Comparator.comparing(SpreadBlock::getStrength).reversed());
 
-            if (this.heatMultiplierByPos.get(offsetPos) != null) {
-                AbstractMap.SimpleEntry<BlockPos,Integer> queueItem = new AbstractMap.SimpleEntry<>(offsetPos, this.heatMultiplierByPos.get(offsetPos));
-                this.invalidatedPos.add(queueItem);
+        for (SpreadBlock invalidatedBlock : this.invalidatedPos) {
+            Integer maxStrength = invalidatedBlock.getStrength();
+            boolean stillValid = true;
+
+            // Already reindexed and have different strength comparing to the state when we invalidated
+            // Remember that we sorting before cleanup
+            // OR already removed by invalidated block with more strength
+            // This is not only optimizes process, but also removes less
+            // Powerful invalidated blocks
+            if (this.spreadedBlocks.get(invalidatedBlock.getPos()) == null || this.spreadedBlocks.get(invalidatedBlock.getPos()) > maxStrength) {
+                stillValid = false;
+            } else {
+                refillQueue.add(invalidatedBlock);
+                ToughAsNails.logger.warn("TAN Added to Queue: " + invalidatedBlock.getPos());
+            }
+
+            cleanupQueue.add(invalidatedBlock);
+
+            do {
+                SpreadBlock cleaningBlock = cleanupQueue.pop();
+                this.spreadedBlocks.remove(cleaningBlock.getPos());
+                cleaned++;
+
+                ToughAsNails.logger.warn("TAN Cleaned: " + cleaningBlock.getPos());
+
+                for (EnumFacing facing : EnumFacing.values()) {
+                    BlockPos offsetPos = cleaningBlock.getPos().offset(facing);
+
+                    // Just remove, we'll rebuild edges
+                    if (this.edgeBlocks.get(offsetPos) != null) {
+                        this.edgeBlocks.remove(offsetPos);
+                    }
+
+                    // Don't need to cleanup what's not indexed or what have more strength cause we removed
+                    // Block that is already at some distance
+                    if (this.spreadedBlocks.get(offsetPos) == null || this.spreadedBlocks.get(offsetPos) > maxStrength) {
+                        continue;
+                    }
+
+                    // If it has same strength nearby -- we need to put it into queue to make sure we reindex from all edges
+                    if (stillValid && this.spreadedBlocks.get(offsetPos).equals(maxStrength)) {
+                        refillQueue.add(new SpreadBlock(offsetPos, maxStrength));
+                        ToughAsNails.logger.warn("TAN Added to Queue: " + offsetPos);
+                    } else /* if *(this.spreadedBlocks.get(offsetPos) < maxStrength) - no need to check, see above */ {
+                        SpreadBlock cleanupBlock = new SpreadBlock(offsetPos, this.spreadedBlocks.get(offsetPos));
+                        cleanupQueue.add(cleanupBlock);
+                    }
+                }
+            } while (!cleanupQueue.isEmpty());
+
+            // Restore block removed due to algorithm imperfection
+            // The block was added to start cleaning queue
+            // If it's still valid then continue reindex from it
+            if (stillValid) {
+                this.spreadedBlocks.put(invalidatedBlock.getPos(), invalidatedBlock.getStrength());
             }
         }
+
+        if (TileEntityTemperatureSpread.ENABLE_DEBUG) {
+            ToughAsNails.logger.warn("TAN Cleaned: " + cleaned);
+        }
+
+        this.invalidatedPos.clear();
+
+        return refillQueue;
     }
 
     /**
@@ -161,8 +319,8 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
 
         BlockPos originPos = this.getPos();
 
-        AbstractMap.SimpleEntry<BlockPos,Integer> queueItem = new AbstractMap.SimpleEntry<>(originPos, MAX_SPREAD_DISTANCE);
-        LinkedList<AbstractMap.SimpleEntry<BlockPos,Integer>> positionsToSpread = new LinkedList<>();
+        SpreadBlock queueItem = new SpreadBlock(originPos, MAX_SPREAD_DISTANCE);
+        LinkedList<SpreadBlock> positionsToSpread = new LinkedList<>();
         positionsToSpread.add(queueItem);
 
         fill(positionsToSpread);
@@ -171,35 +329,47 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
         ToughAsNails.logger.warn("TAN Lookup Heated End");
     }
 
-    public void fill(LinkedList<AbstractMap.SimpleEntry<BlockPos,Integer>> positionsToSpread)
+    public void fill(LinkedList<SpreadBlock> positionsToSpread)
     {
-        do {
-            AbstractMap.SimpleEntry<BlockPos,Integer> spreadingPair = positionsToSpread.pop();
-            BlockPos spreadingPosition = spreadingPair.getKey();
+        if (positionsToSpread.isEmpty()) {
+            if (TileEntityTemperatureSpread.ENABLE_DEBUG) {
+                ToughAsNails.logger.warn("TAN Got Empty Queue to Fill");
+            }
 
-            if (spreadingPair == null) {
+            return;
+        }
+
+        do {
+            SpreadBlock spreadBlock = positionsToSpread.pop();
+            BlockPos spreadingPosition = spreadBlock.getPos();
+
+            if (spreadBlock == null) {
                 continue;
             }
 
-            if (spreadingPair.getValue() <= 0) {
+            if (spreadBlock.getStrength() <= 0) {
                 continue;
             }
 
             for (EnumFacing facing : EnumFacing.values())
             {
-                BlockPos offsetPos = spreadingPosition.offset(facing);
-
-                if (this.heatMultiplierByPos.get(offsetPos) != null) {
+                if (TileEntityTemperatureSpread.HORIZONTAL && (facing == EnumFacing.DOWN || facing == EnumFacing.UP)) {
                     continue;
                 }
 
-                Integer nextStrength = spreadingPair.getValue() - 1;
+                BlockPos offsetPos = spreadingPosition.offset(facing);
+
+                if (this.spreadedBlocks.get(offsetPos) != null) {
+                    continue;
+                }
+
+                Integer nextStrength = spreadBlock.getStrength() - 1;
 
                 //Only attempt to update tracking for this position if there is air here.
                 //Even positions already being tracked should be filled with air.
                 if (this.canFill(offsetPos)) {
                     // Add to queue to check spreading
-                    AbstractMap.SimpleEntry<BlockPos,Integer> queueItem = new AbstractMap.SimpleEntry<>(offsetPos, nextStrength);
+                    SpreadBlock queueItem = new SpreadBlock(offsetPos, nextStrength);
                     positionsToSpread.add(queueItem);
 
                     /*
@@ -207,12 +377,62 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
                      * Block positions that were in queue initially (usually only central block) will not be included because
                      * there's no need to warm block itself and quick cached queue should be already in map
                      */
-                    this.heatMultiplierByPos.put(offsetPos, nextStrength);
+                    this.spreadedBlocks.put(offsetPos, nextStrength);
+                } else {
+                    this.addEdge(offsetPos, nextStrength);
                 }
             }
         } while (!positionsToSpread.isEmpty());
 
-        ToughAsNails.logger.warn("TAN Map Items" + this.heatMultiplierByPos.size());
+        ToughAsNails.logger.warn("TAN Spread Volume: " + this.spreadedBlocks.size());
+        ToughAsNails.logger.warn("TAN Edge Blocks: " + this.edgeBlocks.size());
+    }
+
+    private boolean canFill(BlockPos pos)
+    {
+        //Only spread within enclosed areas, significantly reduces the impact on performance and suits the purpose of coils
+        return !this.getWorld().isBlockFullCube(pos) && (!this.getWorld().canSeeSky(pos));
+    }
+
+    private void addEdge(BlockPos pos, Integer strength)
+    {
+        Integer currentStrength = this.edgeBlocks.get(pos);
+
+        if (currentStrength != null && currentStrength > strength) {
+            strength = currentStrength;
+        }
+
+        this.edgeBlocks.put(pos, strength);
+    }
+
+    private void drawDebugLayer(World world)
+    {
+        if (!TileEntityTemperatureSpread.HORIZONTAL || !TileEntityTemperatureSpread.ENABLE_DEBUG) {
+            return;
+        }
+
+        IBlockState woolBlockState = Blocks.WOOL.getDefaultState();
+        IBlockState airBlockState = Blocks.AIR.getDefaultState();
+
+        for (BlockPos pos : this.debugLayer.keySet()) {
+            world.setBlockState(pos, airBlockState);
+        }
+
+        this.debugLayer.clear();
+
+        for (BlockPos pos : this.spreadedBlocks.keySet()) {
+            BlockPos debugBlockPos = pos.offset(EnumFacing.DOWN);
+
+            world.setBlockState(debugBlockPos, woolBlockState.withProperty(BlockColored.COLOR, EnumDyeColor.ORANGE));
+            this.debugLayer.put(debugBlockPos, 1);
+        }
+
+        for (BlockPos pos : this.edgeBlocks.keySet()) {
+            BlockPos debugBlockPos = pos.offset(EnumFacing.DOWN);
+
+            world.setBlockState(debugBlockPos, woolBlockState.withProperty(BlockColored.COLOR, EnumDyeColor.BLUE));
+            this.debugLayer.put(debugBlockPos, -1);
+        }
     }
 
     /**
@@ -242,12 +462,6 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
 
         return true;
     }*/
-    
-    private boolean canFill(BlockPos pos)
-    {
-        //Only spread within enclosed areas, significantly reduces the impact on performance and suits the purpose of coils
-        return !this.getWorld().isBlockFullCube(pos) && (!this.getWorld().canSeeSky(pos));
-    }
     
     /*@Override
     public void readFromNBT(NBTTagCompound compound)
@@ -343,6 +557,31 @@ public class TileEntityTemperatureSpread extends TileEntity implements ITickable
     @Override
     public boolean isPosRegulated(BlockPos pos) 
     {
-        return this.heatMultiplierByPos.get(pos) != null;
+        return this.spreadedBlocks.get(pos) != null;
+    }
+
+    // Immutable after creation, that's safer
+    class SpreadBlock {
+        private BlockPos pos;
+        private Integer strength;
+
+        public SpreadBlock(BlockPos pos, Integer strength)
+        {
+            Validate.notNull(pos, "Position cannot be null");
+            Validate.notNull(strength, "Strength cannot be null");
+
+            this.pos = pos;
+            this.strength = strength;
+        }
+
+        public Integer getStrength()
+        {
+            return this.strength;
+        }
+
+        public BlockPos getPos()
+        {
+            return this.pos;
+        }
     }
 }
